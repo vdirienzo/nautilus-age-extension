@@ -1,5 +1,7 @@
 # 🚀 GUÍA RÁPIDA DE INSTALACIÓN - AGE NAUTILUS
 
+**Versión:** 1.2.0 | **Seguridad:** Rate limiting + Path validation
+
 ## ⚡ Instalación en 3 pasos
 
 ### 1️⃣ Descarga los archivos
@@ -22,8 +24,14 @@ Abre Nautilus y click derecho en cualquier archivo. Verás las nuevas opciones d
 ### Encriptar un archivo
 1. Click derecho en el archivo
 2. Selecciona "🔒 Encrypt with age"
-3. Ingresa contraseña (2 veces)
+3. Ingresa contraseña (2 veces) **o usa el generador**
 4. Listo! Se crea `archivo.ext.age`
+
+### 🎲 Generar passphrase segura
+1. En el diálogo de contraseña, click en **"🎲 Generate Passphrase"**
+2. Se genera algo como: `tiger-ocean-mountain-castle`
+3. La passphrase se copia automáticamente al clipboard
+4. Click OK (no necesitas confirmar si fue generada)
 
 ### Desencriptar un archivo
 1. Click derecho en `archivo.ext.age`
@@ -79,6 +87,15 @@ Lee el **README.md** completo para:
 ```bash
 ./uninstall-age-nautilus.sh
 ```
+
+---
+
+## 🛡️ Seguridad (v1.2.0)
+
+- **Rate limiting**: 3 intentos fallidos = 30s de bloqueo
+- **Path validation**: Protección contra ataques de traversal
+- **Logging**: Eventos de seguridad registrados
+- **Semgrep audit**: 0 vulnerabilidades detectadas
 
 ---
 
