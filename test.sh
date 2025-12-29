@@ -29,11 +29,11 @@ test_command() {
     echo -n "Testing $name... "
     if command -v "$cmd" &> /dev/null; then
         echo -e "${GREEN}✓${NC}"
-        ((PASSED++))
+        ((++PASSED))
         return 0
     else
         echo -e "${RED}✗${NC}"
-        ((FAILED++))
+        ((++FAILED))
         return 1
     fi
 }
@@ -46,11 +46,11 @@ test_package() {
     echo -n "Testing $name... "
     if dpkg -l | grep -q "^ii  $pkg"; then
         echo -e "${GREEN}✓${NC}"
-        ((PASSED++))
+        ((++PASSED))
         return 0
     else
         echo -e "${RED}✗${NC}"
-        ((FAILED++))
+        ((++FAILED))
         return 1
     fi
 }
@@ -63,11 +63,11 @@ test_file() {
     echo -n "Testing $name... "
     if [ -f "$file" ]; then
         echo -e "${GREEN}✓${NC}"
-        ((PASSED++))
+        ((++PASSED))
         return 0
     else
         echo -e "${RED}✗${NC}"
-        ((FAILED++))
+        ((++FAILED))
         return 1
     fi
 }
@@ -83,7 +83,7 @@ test_command "tar" "TAR compression"
 echo -n "Testing mat2 (optional)... "
 if command -v mat2 &> /dev/null; then
     echo -e "${GREEN}✓${NC} (metadata cleaning enabled)"
-    ((PASSED++))
+    ((++PASSED))
 else
     echo -e "${YELLOW}○${NC} (not installed - metadata cleaning disabled)"
     echo -e "    ${YELLOW}To enable: sudo apt install mat2${NC}"
@@ -108,7 +108,7 @@ echo -e "${BLUE}[4/6] Checking extension installation...${NC}"
 EXTENSION_FILE="$HOME/.local/share/nautilus-python/extensions/nautilus-age-extension.py"
 if [ -f "$EXTENSION_FILE" ]; then
     echo -e "Extension installed: ${GREEN}✓${NC}"
-    ((PASSED++))
+    ((++PASSED))
 else
     echo -e "Extension installed: ${YELLOW}Not installed (run install script)${NC}"
 fi
@@ -121,35 +121,35 @@ echo "Test data for age encryption" > "$TEST_FILE"
 echo -n "Testing age encryption... "
 if echo -e "testpassword\ntestpassword" | age -p "$TEST_FILE" > "$TEST_FILE.age" 2>/dev/null; then
     echo -e "${GREEN}✓${NC}"
-    ((PASSED++))
+    ((++PASSED))
 
     echo -n "Testing age decryption... "
     if echo "testpassword" | age -d "$TEST_FILE.age" > "$TEST_FILE.decrypted" 2>/dev/null; then
         echo -e "${GREEN}✓${NC}"
-        ((PASSED++))
+        ((++PASSED))
 
         echo -n "Verifying decrypted content... "
         if diff -q "$TEST_FILE" "$TEST_FILE.decrypted" &>/dev/null; then
             echo -e "${GREEN}✓${NC}"
-            ((PASSED++))
+            ((++PASSED))
         else
             echo -e "${RED}✗${NC}"
-            ((FAILED++))
+            ((++FAILED))
         fi
     else
         echo -e "${RED}✗${NC}"
-        ((FAILED++))
+        ((++FAILED))
     fi
 else
     echo -e "${RED}✗${NC}"
-    ((FAILED++))
+    ((++FAILED))
 fi
 
 # Clean up test files
 rm -f "$TEST_FILE" "$TEST_FILE.age" "$TEST_FILE.decrypted"
 echo ""
 
-echo -e "${BLUE}[6/6] Testing metadata cleaning (optional)...${NC}"
+echo -e "${BLUE}[6/7] Testing metadata cleaning (optional)...${NC}"
 if command -v mat2 &> /dev/null; then
     # Create a test file and check mat2 can process it
     MAT2_TEST="/tmp/mat2-test-$$.txt"
@@ -157,15 +157,50 @@ if command -v mat2 &> /dev/null; then
     echo -n "Testing mat2 execution... "
     if mat2 --inplace --unknown-members omit "$MAT2_TEST" &>/dev/null; then
         echo -e "${GREEN}✓${NC}"
-        ((PASSED++))
+        ((++PASSED))
     else
         # Return code 1 means unsupported format, which is OK
         echo -e "${GREEN}✓${NC} (format not supported, but mat2 works)"
-        ((PASSED++))
+        ((++PASSED))
     fi
     rm -f "$MAT2_TEST"
 else
     echo -e "mat2 not installed - ${YELLOW}skipped${NC}"
+fi
+echo ""
+
+echo -e "${BLUE}[7/7] Testing PKCS#11/HSM support (optional)...${NC}"
+# Check for PKCS#11 module (SafeNet eToken)
+PKCS11_FOUND=0
+PKCS11_PATHS=(
+    "/usr/lib/libeToken.so"
+    "/usr/lib64/libeToken.so"
+    "/opt/eToken/lib/libeToken.so"
+    "/usr/lib/x86_64-linux-gnu/libeToken.so"
+)
+
+for path in "${PKCS11_PATHS[@]}"; do
+    if [ -f "$path" ]; then
+        PKCS11_FOUND=1
+        echo -e "SafeNet eToken driver: ${GREEN}✓${NC} ($path)"
+        ((++PASSED))
+        break
+    fi
+done
+
+if [ "$PKCS11_FOUND" -eq 0 ]; then
+    echo -e "SafeNet eToken driver: ${YELLOW}○${NC} (not installed)"
+    echo -e "    ${YELLOW}HSM encryption option will not appear in menu${NC}"
+fi
+
+# Check for pkcs11-tool
+echo -n "Testing pkcs11-tool (opensc)... "
+if command -v pkcs11-tool &> /dev/null; then
+    echo -e "${GREEN}✓${NC}"
+    ((++PASSED))
+else
+    echo -e "${YELLOW}○${NC} (not installed)"
+    echo -e "    ${YELLOW}Install with: sudo apt install opensc${NC}"
 fi
 echo ""
 

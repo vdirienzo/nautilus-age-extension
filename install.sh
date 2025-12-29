@@ -2,9 +2,21 @@
 # install.sh
 # Installation script for the Nautilus AGE Encryption extension
 #
-# Usage: ./install.sh
+# Usage: ./install.sh [--with-pkcs11]
+#   --with-pkcs11  Install PKCS#11 support for hardware tokens (SafeNet eToken)
 
 set -e
+
+# Parse arguments
+WITH_PKCS11=0
+for arg in "$@"; do
+    case $arg in
+        --with-pkcs11)
+            WITH_PKCS11=1
+            shift
+            ;;
+    esac
+done
 
 # Colors for output
 RED='\033[0;31m'
@@ -95,6 +107,21 @@ else
     print_success "All dependencies are installed"
 fi
 
+# Install PKCS#11 support if requested
+if [ "$WITH_PKCS11" -eq 1 ]; then
+    echo ""
+    print_status "Installing PKCS#11 support (opensc)..."
+    if ! command -v pkcs11-tool &> /dev/null; then
+        sudo apt install -y opensc
+        print_success "opensc (pkcs11-tool) installed"
+    else
+        print_success "opensc already installed"
+    fi
+    echo ""
+    print_warning "Note: SafeNet eToken drivers must be installed manually."
+    print_warning "Download from: https://cpl.thalesgroup.com/access-management/safenet-trusted-access/authentication-software"
+fi
+
 # Create Nautilus extension directory if it doesn't exist
 EXTENSION_DIR="$HOME/.local/share/nautilus-python/extensions"
 print_status "Creating extension directory..."
@@ -162,6 +189,12 @@ echo "  ✓ Auto-generated 24-word passphrases (~215 bits entropy)"
 echo "  ✓ No manual passwords - maximum security by default"
 echo "  ✓ Auto-copy passphrase to clipboard"
 echo "  ✓ Auto-extract encrypted folders on decryption"
+echo ""
+echo -e "${BLUE}New in v1.7.0 - HSM Support (optional):${NC}"
+echo "  ✓ Hardware Random Number Generator (SafeNet eToken)"
+echo "  ✓ PKCS#11 integration for true hardware entropy"
+echo "  ✓ Auto-detected when libeToken.so is installed"
+echo "  ✓ Install with: ./install.sh --with-pkcs11"
 echo ""
 echo -e "${YELLOW}Security note:${NC}"
 echo "  • Passphrases are generated automatically (24 words)"

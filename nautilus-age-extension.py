@@ -19,12 +19,16 @@ Date: December 2025
 License: MIT
 """
 
+import argparse
+import base64
+import json
 import logging
 import os
 import pty
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections import defaultdict
@@ -32,10 +36,10 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from typing import Dict, List, Optional, Tuple
 
-# Configure logging for the extension
+# Configure logging for the extension (errors only)
 logging.basicConfig(
     level=logging.WARNING,
-    format='%(name)s: %(levelname)s: %(message)s'
+    format='%(asctime)s %(name)s: %(levelname)s: %(message)s'
 )
 logger = logging.getLogger('age-nautilus')
 
@@ -43,6 +47,18 @@ logger = logging.getLogger('age-nautilus')
 RATE_LIMIT_MAX_ATTEMPTS = 3
 RATE_LIMIT_LOCKOUT_SECONDS = 30
 RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minutes
+
+# === PKCS#11 HSM Support (Optional) ===
+# SafeNet eToken module paths to auto-detect
+PKCS11_MODULE_PATHS = [
+    '/usr/lib/libeToken.so',
+    '/usr/lib64/libeToken.so',
+    '/opt/eToken/lib/libeToken.so',
+    '/usr/lib/x86_64-linux-gnu/libeToken.so',
+    '/usr/lib/i386-linux-gnu/libeToken.so',
+]
+PKCS11_RANDOM_BYTES = 256  # 2048 bits of entropy (~342 chars Base64)
+PKCS11_TIMEOUT = 30  # seconds
 
 # Detect available Nautilus version
 # IMPORTANT: DO NOT use exit() - it crashes Nautilus
@@ -431,6 +447,10 @@ class AgeEncryptionExtension(GObject.GObject, Nautilus.MenuProvider):
             # Menu for encryption (handles both files and folders)
             items.append(self.create_encrypt_menu_item(paths))
 
+            # Add HSM option if PKCS#11 module is available
+            if self.find_pkcs11_module():
+                items.append(self.create_encrypt_hsm_menu_item(paths))
+
         return items
     
     def create_encrypt_menu_item(self, paths: List[str]) -> 'Nautilus.MenuItem':
@@ -460,6 +480,36 @@ class AgeEncryptionExtension(GObject.GObject, Nautilus.MenuProvider):
         item.connect('activate', lambda menu, p=list(paths): self.on_encrypt_items(menu, p))
         return item
 
+    def create_encrypt_hsm_menu_item(self, paths: List[str]) -> 'Nautilus.MenuItem':
+        """Create menu item for HSM-based encryption.
+
+        Only shown when PKCS#11 module (SafeNet eToken) is detected.
+        """
+        # Count files and folders for dynamic label
+        num_files = sum(1 for p in paths if os.path.isfile(p))
+        num_folders = sum(1 for p in paths if os.path.isdir(p))
+
+        if len(paths) == 1:
+            if num_folders == 1:
+                label = "Encrypt folder with HSM"
+            else:
+                label = "Encrypt with HSM"
+        else:
+            parts = []
+            if num_files > 0:
+                parts.append(f"{num_files} file{'s' if num_files > 1 else ''}")
+            if num_folders > 0:
+                parts.append(f"{num_folders} folder{'s' if num_folders > 1 else ''}")
+            label = f"Encrypt {' + '.join(parts)} with HSM"
+
+        item = Nautilus.MenuItem(
+            name='AgeExtension::EncryptItemsHSM',
+            label=label,
+            tip='Encrypt using SafeNet token TRNG (hardware random)'
+        )
+        item.connect('activate', lambda menu, p=list(paths): self.on_encrypt_items_hsm(menu, p))
+        return item
+
     def create_decrypt_menu_item(self, paths: List[str]) -> 'Nautilus.MenuItem':
         """Create menu item for decryption"""
         if len(paths) == 1:
@@ -486,205 +536,108 @@ class AgeEncryptionExtension(GObject.GObject, Nautilus.MenuProvider):
             return None
     
     def on_encrypt_items(self, menu: 'Nautilus.MenuItem', paths: List[str]) -> None:
-        """Handler for encrypting files and/or folders"""
-        # Minimal delay to let context menu close
-        GLib.timeout_add(50, self._do_encrypt_items, paths)
+        """Handler for encrypting files and/or folders.
 
-    def _do_encrypt_items(self, paths: List[str]) -> bool:
-        """Encrypt files and folders into a single archive."""
-        temp_dir = None
-        tar_path = None
+        Launches a completely separate process to avoid blocking Nautilus.
+        The subprocess handles dialog, mat2, tar, and age encryption.
+        Returns immediately so Nautilus stays responsive.
+        """
+        script_path = os.path.realpath(__file__)
+        paths_json = json.dumps(paths)
+        subprocess.Popen(
+            [sys.executable, script_path, '--encrypt', paths_json],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        # Returns IMMEDIATELY - Nautilus stays 100% responsive
 
-        try:
-            # 1. Ask for passphrase
-            password, _, delete_originals = self.ask_password_method()
-            if not password:
-                return False
+    # === HSM Encryption Handlers ===
 
-            # Immediate feedback to user
-            self.show_notification("Encrypting...", f"⏳ Processing {len(paths)} item(s)")
+    def on_encrypt_items_hsm(self, menu: 'Nautilus.MenuItem', paths: List[str]) -> None:
+        """Handler for encrypting files/folders using HSM-generated passphrase.
 
-            clean_metadata = self.check_mat2_installed()
+        Launches a completely separate process to avoid blocking Nautilus.
+        Returns immediately so Nautilus stays responsive.
+        """
+        script_path = os.path.realpath(__file__)
+        paths_json = json.dumps(paths)
+        subprocess.Popen(
+            [sys.executable, script_path, '--hsm', paths_json],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        # Returns IMMEDIATELY - Nautilus stays 100% responsive
 
-            # 2. Create temp directory
-            temp_dir = tempfile.mkdtemp(prefix='age_bundle_')
-
-            # 3. Copy all items to temp
-            for item_path in paths:
-                item_path = os.path.normpath(item_path)
-                basename = os.path.basename(item_path)
-                dest = os.path.join(temp_dir, basename)
-
-                if os.path.isfile(item_path):
-                    shutil.copy2(item_path, dest)
-                elif os.path.isdir(item_path):
-                    # Security: Don't follow symlinks to prevent symlink attacks
-                    shutil.copytree(item_path, dest, symlinks=False, ignore_dangling_symlinks=True)
-
-            # 4. Clean metadata from all files in temp
-            cleaned_count = 0
-            if clean_metadata:
-                for root, dirs, files in os.walk(temp_dir):
-                    for filename in files:
-                        fp = os.path.join(root, filename)
-                        try:
-                            result = subprocess.run(
-                                ['mat2', '--inplace', '--unknown-members', 'omit', fp],
-                                capture_output=True, timeout=60
-                            )
-                            if result.returncode in (0, 1):
-                                cleaned_count += 1
-                        except (subprocess.TimeoutExpired, OSError):
-                            pass
-
-            # 5. Determine output name and location
-            output_dir = os.path.dirname(os.path.normpath(paths[0]))
-            if len(paths) == 1:
-                bundle_name = os.path.basename(os.path.normpath(paths[0]))
-            else:
-                timestamp = time.strftime('%Y%m%d_%H%M%S')
-                bundle_name = f"encrypted_bundle_{timestamp}"
-
-            tar_path = os.path.join(output_dir, f"{bundle_name}.tar.gz")
-
-            # 6. Create tar.gz
-            subprocess.run([
-                'tar', '-czf', tar_path, '-C', temp_dir, '.'
-            ], check=True, capture_output=True)
-
-            # 7. Encrypt
-            encrypted_path = f"{tar_path}.age"
-            success = self.encrypt_file(tar_path, encrypted_path, password)
-
-            # 8. Cleanup tar (keep only .age) - use try/except to avoid TOCTOU race
-            try:
-                os.remove(tar_path)
-                tar_path = None
-            except FileNotFoundError:
-                tar_path = None  # Already gone, OK
-
-            # 9. Delete originals if requested
-            if success and delete_originals:
-                for item_path in paths:
-                    item_path = os.path.normpath(item_path)
-                    if os.path.isfile(item_path):
-                        self.secure_delete(item_path)
-                    elif os.path.isdir(item_path):
-                        if self.validate_path(item_path):
-                            shutil.rmtree(item_path)
-
-            # 10. Notify
-            if success:
-                msg = f"✅ {len(paths)} item(s) → {os.path.basename(encrypted_path)}"
-                if clean_metadata and cleaned_count > 0:
-                    msg += f" ({cleaned_count} cleaned)"
-                if delete_originals:
-                    msg += " (originals deleted)"
-                self.show_notification("Done", msg)
-            else:
-                self.show_error("Error", "Encryption failed")
-
-            return False
-
-        except Exception as e:
-            logger.error(f"Encryption error: {e}")
-            self.show_error("Error", str(e))
-            return False
-
-        finally:
-            # Cleanup - use try/except to avoid TOCTOU race conditions
-            if tar_path:
-                try:
-                    os.remove(tar_path)
-                except (FileNotFoundError, OSError):
-                    pass  # Already gone or inaccessible
-            if temp_dir:
-                try:
-                    shutil.rmtree(temp_dir)
-                except (FileNotFoundError, OSError):
-                    pass  # Already gone or inaccessible
-
-    def on_decrypt_files(self, menu: 'Nautilus.MenuItem', paths: List[str]) -> None:
-        """Handler for decrypting files"""
-        GLib.timeout_add(50, self._do_decrypt_files, paths)
-
-    def _do_decrypt_files(self, paths: List[str]) -> bool:
-        """Actual decryption logic with rate limiting protection.
+    def _ask_hsm_confirmation(self, passphrase: str) -> Optional[bool]:
+        """Show HSM passphrase and ask for confirmation.
 
         Args:
-            paths: List of file paths to decrypt
+            passphrase: The HSM-generated passphrase to display
 
         Returns:
-            False to prevent GLib.timeout_add from repeating
+            True if user wants to delete originals, False if keep, None if cancelled
         """
-        # Check rate limit for all files before proceeding
-        for file_path in paths:
-            if not self.check_rate_limit(file_path):
-                return False
+        try:
+            # Copy to clipboard first
+            self.copy_to_clipboard(passphrase)
 
-        # Verify files first
-        invalid_files: List[str] = []
-        for file_path in paths:
-            if not self.verify_age_file(file_path):
-                invalid_files.append(os.path.basename(file_path))
+            # Word wrap passphrase for display (insert newlines every 70 chars)
+            wrapped = '\n'.join(passphrase[i:i+70] for i in range(0, len(passphrase), 70))
 
-        if invalid_files:
-            self.show_error("Invalid files",
-                          "Not valid .age files:\n" + "\n".join(invalid_files))
-            return False
+            zenity_process = subprocess.Popen(
+                ['zenity', '--question',
+                 '--title', 'HSM Passphrase',
+                 '--text', '📋 HSM Passphrase copied to clipboard!\n\n'
+                          f'<tt>{wrapped}</tt>\n\n'
+                          '🔒 Generated from hardware TRNG\n\n'
+                          '⚠️ Save this passphrase somewhere safe NOW!',
+                 '--ok-label', 'Encrypt (keep original)',
+                 '--cancel-label', 'Cancel',
+                 '--extra-button', 'Encrypt & Delete original',
+                 '--width', '600'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
 
-        # Ask for password
-        password = self.ask_password("🔓 Decrypt", "Enter password:")
-        if not password:
-            return False
+            stdout, _ = zenity_process.communicate(timeout=300)
+            returncode = zenity_process.returncode
 
-        success_count: int = 0
-        fail_count: int = 0
-
-        for file_path in paths:
-            decrypted_path = file_path[:-4] if file_path.endswith('.age') else f"{file_path}.decrypted"
-
-            if self.decrypt_file(file_path, decrypted_path, password):
-                success_count += 1
-                # Clear rate limit on successful decryption
-                self.clear_failed_attempts(file_path)
-
-                # If it's a tar.gz, extract automatically with security validation
-                if decrypted_path.endswith('.tar.gz'):
-                    try:
-                        # Security: Validate tar contents before extraction (zip-slip protection)
-                        list_result = subprocess.run(
-                            ['tar', '-tzf', decrypted_path],
-                            capture_output=True, text=True, timeout=60
-                        )
-                        if list_result.returncode == 0:
-                            for member in list_result.stdout.splitlines():
-                                if member.startswith('/') or '..' in member:
-                                    raise ValueError(f"Suspicious path in archive: {member}")
-
-                        subprocess.run([
-                            'tar', '-xzf', decrypted_path,
-                            '-C', os.path.dirname(decrypted_path)
-                        ], check=True, capture_output=True)
-                        os.remove(decrypted_path)
-                    except subprocess.CalledProcessError as e:
-                        self.show_error("Error", f"Extraction failed: {e}")
+            if returncode == 0:
+                return False  # Keep originals
+            elif 'Delete' in stdout:
+                return True  # Delete originals
             else:
-                fail_count += 1
-                # Record failed attempt for rate limiting
-                self.record_failed_attempt(file_path)
+                return None  # Cancelled
 
-        if success_count > 0:
-            self.show_notification("Done", f"✅ {success_count} file(s) decrypted")
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            if 'zenity_process' in locals():
+                zenity_process.kill()
+            return None
 
-        if fail_count > 0:
-            self.show_error("Error", f"Failed: {fail_count} file(s). Check password.")
+    def on_decrypt_files(self, menu: 'Nautilus.MenuItem', paths: List[str]) -> None:
+        """Handler for decrypting files.
 
-        return False  # Don't repeat GLib.timeout_add
+        Launches a completely separate process to avoid blocking Nautilus.
+        Returns immediately so Nautilus stays responsive.
+        """
+        script_path = os.path.realpath(__file__)
+        paths_json = json.dumps(paths)
+        subprocess.Popen(
+            [sys.executable, script_path, '--decrypt', paths_json],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        # Returns IMMEDIATELY - Nautilus stays 100% responsive
 
     def encrypt_file(self, input_path: str, output_path: str, password: str) -> bool:
         """Encrypt a file with age securely using PTY"""
-        import time
         master_fd = None
         slave_fd = None
         process = None
@@ -971,10 +924,219 @@ class AgeEncryptionExtension(GObject.GObject, Nautilus.MenuProvider):
         words = [secrets.choice(PASSPHRASE_WORDLIST) for _ in range(num_words)]
         return '-'.join(words)
 
+    # === PKCS#11 HSM Support Functions ===
+
+    def validate_pkcs11_module_path(self, path: str) -> bool:
+        """Validate that a PKCS#11 module path is safe.
+
+        Only allows modules from the predefined whitelist to prevent
+        loading arbitrary shared libraries.
+
+        Args:
+            path: Path to validate
+
+        Returns:
+            True if path is in the allowed whitelist, False otherwise
+        """
+        if not path:
+            return False
+        # Only allow paths from our whitelist (case-sensitive exact match)
+        return path in PKCS11_MODULE_PATHS
+
+    def validate_hsm_pin(self, pin: str) -> Tuple[bool, str]:
+        """Validate HSM PIN format.
+
+        SafeNet tokens typically accept 4-16 character PINs.
+
+        Args:
+            pin: PIN to validate
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not pin:
+            return (False, "PIN cannot be empty")
+        if len(pin) < 4:
+            return (False, "PIN too short (minimum 4 characters)")
+        if len(pin) > 16:
+            return (False, "PIN too long (maximum 16 characters)")
+        # Basic sanity: only printable ASCII (no control characters)
+        if not all(32 <= ord(c) <= 126 for c in pin):
+            return (False, "PIN contains invalid characters")
+        return (True, "")
+
+    def find_pkcs11_module(self) -> Optional[str]:
+        """Find installed PKCS#11 module path (SafeNet eToken).
+
+        Checks multiple common installation paths for the SafeNet
+        eToken driver.
+
+        Returns:
+            Path to libeToken.so if found, None otherwise
+        """
+        for path in PKCS11_MODULE_PATHS:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def is_hsm_token_present(self, module_path: str) -> bool:
+        """Check if HSM token is physically connected.
+
+        Uses pkcs11-tool to query the token slots.
+
+        Args:
+            module_path: Path to the PKCS#11 module (.so file)
+
+        Returns:
+            True if a token is present in any slot, False otherwise
+        """
+        # Security: validate module path is in whitelist
+        if not self.validate_pkcs11_module_path(module_path):
+            logger.warning("Invalid PKCS#11 module path rejected")
+            return False
+
+        try:
+            result = subprocess.run(
+                ['pkcs11-tool', '--module', module_path, '--list-slots'],
+                capture_output=True,
+                timeout=5
+            )
+            # Check for token presence indicators in output
+            output = result.stdout.lower()
+            return b'token present' in output or (result.returncode == 0 and b'slot' in output)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
+
+    def ask_hsm_pin(self) -> Optional[str]:
+        """Ask user for HSM token PIN using zenity.
+
+        Returns:
+            The PIN entered by the user, or None if cancelled
+        """
+        try:
+            result = subprocess.run(
+                ['zenity', '--password',
+                 '--title', '🔐 HSM Token PIN',
+                 '--text', 'Enter your SafeNet token PIN:'],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+        return None
+
+    def generate_passphrase_from_hsm(self, module_path: str, pin: str) -> Optional[str]:
+        """Generate passphrase using HSM's True Random Number Generator.
+
+        Uses pkcs11-tool to generate cryptographically secure random bytes
+        from the hardware token's TRNG, then encodes them as Base64.
+
+        Args:
+            module_path: Path to the PKCS#11 module
+            pin: User's PIN for the token
+
+        Returns:
+            Base64-encoded passphrase (43 chars) or None on failure
+        """
+        # Security: validate module path is in whitelist
+        if not self.validate_pkcs11_module_path(module_path):
+            logger.warning("Invalid PKCS#11 module path rejected")
+            return None
+
+        tmp_path = None
+        process = None
+
+        try:
+            # Create secure temporary file with restrictive umask
+            old_umask = os.umask(0o077)  # Only owner can access new files
+            try:
+                fd, tmp_path = tempfile.mkstemp(prefix='hsm_random_', suffix='.bin')
+                os.close(fd)
+                os.chmod(tmp_path, 0o600)  # Explicitly ensure only owner can read
+            finally:
+                os.umask(old_umask)  # Restore original umask
+
+            # Use --pin option (pkcs11-tool's util_getpass doesn't work with PTY)
+            # Note: PIN briefly visible in /proc/<pid>/cmdline but process is short-lived
+            process = subprocess.Popen(
+                ['pkcs11-tool', '--module', module_path,
+                 '--login', '--pin', pin,
+                 '--generate-random', str(PKCS11_RANDOM_BYTES),
+                 '--output-file', tmp_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # Wait for completion
+            stdout, stderr = process.communicate(timeout=PKCS11_TIMEOUT)
+
+            if process.returncode != 0:
+                # Log detailed error internally but don't expose to user
+                # (prevents information leakage about HSM internals)
+                logger.warning("PKCS#11 operation failed (check PIN or token)")
+                return None
+
+            # Read generated random bytes
+            with open(tmp_path, 'rb') as f:
+                random_bytes = f.read()
+
+            if len(random_bytes) != PKCS11_RANDOM_BYTES:
+                # Generic message to avoid leaking HSM implementation details
+                logger.warning("HSM random generation failed (unexpected output)")
+                return None
+
+            # Encode as URL-safe Base64 without padding (43 characters)
+            passphrase = base64.urlsafe_b64encode(random_bytes).decode('utf-8').rstrip('=')
+            return passphrase
+
+        except subprocess.TimeoutExpired:
+            logger.error("HSM timeout generating random")
+            if process:
+                process.kill()
+                process.wait()  # Prevent zombie
+            return None
+        except Exception as e:
+            logger.error(f"HSM generation failed: {e}")
+            return None
+        finally:
+            # Secure cleanup of temporary file containing HSM random bytes
+            # CRITICAL: This file must be destroyed - it contains key material
+            if tmp_path:
+                try:
+                    # First: overwrite with zeros (in case shred fails)
+                    if os.path.exists(tmp_path):
+                        with open(tmp_path, 'wb') as f:
+                            f.write(b'\x00' * PKCS11_RANDOM_BYTES)
+                            f.flush()
+                            os.fsync(f.fileno())  # Force write to disk
+                except OSError:
+                    pass
+
+                # Then: secure delete with shred
+                try:
+                    self.secure_delete(tmp_path)
+                except (FileNotFoundError, OSError):
+                    pass
+
+                # Final fallback: force remove if still exists
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                        logger.warning("HSM temp file required fallback deletion")
+                except OSError:
+                    logger.error("CRITICAL: Could not delete HSM temp file!")
+
     def copy_to_clipboard(self, text: str) -> bool:
         """Copy text to system clipboard (Wayland optimized).
 
         Uses wl-copy directly for Wayland.
+
+        Args:
+            text: Text to copy to clipboard
 
         Returns:
             True if clipboard copy succeeded, False otherwise
@@ -1014,7 +1176,7 @@ class AgeEncryptionExtension(GObject.GObject, Nautilus.MenuProvider):
                  '--title', '🔐 Secure Passphrase',
                  '--text', '📋 Passphrase copied to clipboard!\n\n'
                           f'<tt><b>{passphrase}</b></tt>\n\n'
-                          '⚠️ Save this passphrase now!',
+                          '⚠️ Save this passphrase somewhere safe NOW!',
                  '--ok-label', '🔒 Encrypt (keep original)',
                  '--cancel-label', 'Cancel',
                  '--extra-button', '🔒🗑️ Encrypt & Delete original',
@@ -1086,3 +1248,457 @@ class AgeEncryptionExtension(GObject.GObject, Nautilus.MenuProvider):
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             # Fallback to logger if zenity is not available
             logger.error(f"Dialog error: {title} - {message}")
+
+
+# ==============================================================================
+# CLI Mode - Standalone execution for subprocess calls from Nautilus
+# ==============================================================================
+# When Nautilus calls on_encrypt_items/on_decrypt_files/on_encrypt_items_hsm,
+# they spawn this script as a separate process. This completely avoids GIL
+# contention with Nautilus's GLib main loop, preventing "slow application" dialogs.
+
+def standalone_encrypt(paths: List[str]) -> None:
+    """Standalone encryption - runs in separate process from Nautilus.
+
+    Args:
+        paths: List of file/folder paths to encrypt
+    """
+    ext = AgeEncryptionExtension()
+
+    # 1. Ask for passphrase (blocks this process, not Nautilus)
+    password, _, delete_originals = ext.ask_password_method()
+    if not password:
+        return
+
+    # 2. Check mat2 availability
+    clean_metadata = ext.check_mat2_installed()
+
+    # 3. Show notification that work is starting
+    ext.show_notification("Encrypting...",
+        f"Processing {len(paths)} item(s)...\n"
+        "A notification will appear when done.")
+
+    # 4. Do encryption work (inline, no callback needed in standalone mode)
+    temp_dir = None
+    tar_path = None
+
+    try:
+        # Create temp directory
+        temp_dir = tempfile.mkdtemp(prefix='age_bundle_')
+
+        # Copy all items to temp using external cp command
+        for item_path in paths:
+            item_path = os.path.normpath(item_path)
+            if not os.path.exists(item_path):
+                raise FileNotFoundError(f"Source path does not exist: {item_path}")
+            basename = os.path.basename(item_path)
+            dest = os.path.join(temp_dir, basename)
+            result = subprocess.run(
+                ['cp', '-a', '--', item_path, dest],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode('utf-8', errors='replace')
+                raise RuntimeError(f"cp failed for {item_path}: {stderr}")
+
+        # Clean metadata from all files in temp (single pass)
+        cleaned_count = 0
+        if clean_metadata:
+            all_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                for filename in files:
+                    all_files.append(os.path.join(root, filename))
+
+            if all_files:
+                for fp in all_files:
+                    try:
+                        mat2_result = subprocess.run(
+                            ['mat2', '--inplace', '--unknown-members', 'omit', fp],
+                            capture_output=True, timeout=5
+                        )
+                        if mat2_result.returncode in (0, 1):
+                            cleaned_count += 1
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+
+        # Determine output name and location
+        output_dir = os.path.dirname(os.path.normpath(paths[0]))
+        if len(paths) == 1:
+            bundle_name = os.path.basename(os.path.normpath(paths[0]))
+        else:
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            bundle_name = f"encrypted_bundle_{timestamp}"
+
+        # Create tar.gz in a SEPARATE temp location (not inside temp_dir!)
+        # This avoids tar trying to include itself in the archive
+        tar_fd, tar_path = tempfile.mkstemp(suffix='.tar.gz', prefix='age_archive_')
+        os.close(tar_fd)  # Close FD, we'll use the path with tar
+        result = subprocess.run([
+            'tar', '-czf', tar_path, '-C', temp_dir, '.'
+        ], capture_output=True)
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='replace')
+            raise RuntimeError(f"tar failed: {stderr}")
+
+        # Encrypt to TEMP directory first (write-then-move pattern)
+        temp_encrypted = os.path.join(temp_dir, f"{bundle_name}.age")
+        success = ext.encrypt_file(tar_path, temp_encrypted, password)
+
+        # Cleanup tar immediately
+        try:
+            os.remove(tar_path)
+            tar_path = None
+        except FileNotFoundError:
+            tar_path = None
+
+        # Move encrypted file to final destination
+        encrypted_path = None
+        if success:
+            encrypted_path = os.path.join(output_dir, f"{bundle_name}.age")
+            shutil.move(temp_encrypted, encrypted_path)
+
+        # Delete originals if requested
+        if success and delete_originals:
+            for item_path in paths:
+                item_path = os.path.normpath(item_path)
+                if os.path.isfile(item_path):
+                    ext.secure_delete(item_path)
+                elif os.path.isdir(item_path):
+                    if ext.validate_path(item_path):
+                        shutil.rmtree(item_path)
+
+        # Show result notification
+        if success:
+            msg = f"✅ {len(paths)} item(s) → {os.path.basename(encrypted_path)}"
+            if clean_metadata and cleaned_count > 0:
+                msg += f" ({cleaned_count} cleaned)"
+            if delete_originals:
+                msg += " (originals deleted)"
+            subprocess.Popen(
+                ['notify-send', '-i', 'security-high', 'Encryption Complete', msg],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        else:
+            subprocess.Popen(
+                ['notify-send', '-i', 'dialog-error', '-u', 'critical',
+                 'Encryption Failed', 'Could not complete encryption.'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+    except Exception as e:
+        error_msg = str(e)[:200]  # Truncate long errors for notification
+        logger.error(f"Standalone encryption error: {e}")
+        subprocess.Popen(
+            ['notify-send', '-i', 'dialog-error', '-u', 'critical',
+             'Encryption Failed', error_msg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    finally:
+        if tar_path:
+            try:
+                os.remove(tar_path)
+            except (FileNotFoundError, OSError):
+                pass
+        if temp_dir:
+            try:
+                shutil.rmtree(temp_dir)
+            except (FileNotFoundError, OSError):
+                pass
+
+
+def standalone_decrypt(paths: List[str]) -> None:
+    """Standalone decryption - runs in separate process from Nautilus.
+
+    Args:
+        paths: List of .age file paths to decrypt
+    """
+    ext = AgeEncryptionExtension()
+
+    # Check rate limit for all files before proceeding
+    for file_path in paths:
+        if not ext.check_rate_limit(file_path):
+            return
+
+    # Verify files first
+    invalid_files: List[str] = []
+    for file_path in paths:
+        if not ext.verify_age_file(file_path):
+            invalid_files.append(os.path.basename(file_path))
+
+    if invalid_files:
+        ext.show_error("Invalid files",
+                      "Not valid .age files:\n" + "\n".join(invalid_files))
+        return
+
+    # Ask for password
+    password = ext.ask_password("🔓 Decrypt", "Enter password:")
+    if not password:
+        return
+
+    success_count: int = 0
+    fail_count: int = 0
+
+    for file_path in paths:
+        # Use hidden temp file to avoid name collision with extracted content
+        output_dir = os.path.dirname(file_path)
+        temp_decrypted = os.path.join(output_dir, f".{os.path.basename(file_path)}.tmp")
+
+        if ext.decrypt_file(file_path, temp_decrypted, password):
+            success_count += 1
+            ext.clear_failed_attempts(file_path)
+
+            # Check if decrypted file is a gzip archive (magic bytes: 1f 8b)
+            is_gzip = False
+            try:
+                with open(temp_decrypted, 'rb') as f:
+                    magic = f.read(2)
+                    is_gzip = (magic == b'\x1f\x8b')
+            except (IOError, OSError):
+                pass
+
+            # If it's a tar.gz, extract automatically with security validation
+            if is_gzip:
+                try:
+                    # Security: Validate tar contents before extraction
+                    list_result = subprocess.run(
+                        ['tar', '-tzf', temp_decrypted],
+                        capture_output=True, text=True, timeout=60
+                    )
+                    if list_result.returncode == 0:
+                        for member in list_result.stdout.splitlines():
+                            if member.startswith('/') or '..' in member:
+                                raise ValueError(f"Suspicious path in archive: {member}")
+
+                    # Extract to output directory
+                    subprocess.run([
+                        'tar', '-xzf', temp_decrypted, '-C', output_dir
+                    ], check=True, capture_output=True)
+
+                    # Remove temp file
+                    os.remove(temp_decrypted)
+                except subprocess.CalledProcessError as e:
+                    if os.path.exists(temp_decrypted):
+                        os.remove(temp_decrypted)
+                    ext.show_error("Error", f"Extraction failed: {e}")
+            else:
+                # Not a gzip - rename temp to final name
+                final_path = file_path[:-4] if file_path.endswith('.age') else f"{file_path}.decrypted"
+                os.rename(temp_decrypted, final_path)
+        else:
+            fail_count += 1
+            ext.record_failed_attempt(file_path)
+            if os.path.exists(temp_decrypted):
+                os.remove(temp_decrypted)
+
+    if success_count > 0:
+        ext.show_notification("Done", f"✅ {success_count} file(s) decrypted")
+
+    if fail_count > 0:
+        ext.show_error("Error", f"Failed: {fail_count} file(s). Check password.")
+
+
+def standalone_hsm(paths: List[str]) -> None:
+    """Standalone HSM encryption - runs in separate process from Nautilus.
+
+    Args:
+        paths: List of file/folder paths to encrypt with HSM
+    """
+    ext = AgeEncryptionExtension()
+
+    # 1. Find PKCS#11 module
+    module_path = ext.find_pkcs11_module()
+    if not module_path:
+        ext.show_error("HSM Not Found",
+            "SafeNet eToken driver not installed.\n"
+            "Install libeToken.so and try again.")
+        return
+
+    # 2. Verify token is connected
+    if not ext.is_hsm_token_present(module_path):
+        ext.show_error("Token Not Connected",
+            "Please insert your SafeNet token and try again.")
+        return
+
+    # 3. Ask for PIN
+    pin = ext.ask_hsm_pin()
+    if not pin:
+        return
+
+    # 3b. Validate PIN format
+    pin_valid, pin_error = ext.validate_hsm_pin(pin)
+    if not pin_valid:
+        ext.show_error("Invalid PIN", pin_error)
+        return
+
+    # 4. Generate passphrase from HSM TRNG
+    ext.show_notification("Generating...", "Getting random from HSM...")
+    passphrase = ext.generate_passphrase_from_hsm(module_path, pin)
+
+    if not passphrase:
+        ext.show_error("HSM Error",
+            "Failed to generate random from token.\n"
+            "Check PIN and try again.")
+        return
+
+    # 5. Copy passphrase to clipboard and ask for confirmation
+    delete_originals = ext._ask_hsm_confirmation(passphrase)
+    if delete_originals is None:
+        return  # User cancelled
+
+    # 6. Check mat2 availability
+    clean_metadata = ext.check_mat2_installed()
+
+    # 7. Show notification that work is starting
+    ext.show_notification("Encrypting (HSM)...",
+        f"Processing {len(paths)} item(s) with hardware encryption...")
+
+    # 8. Do encryption work (same as standalone_encrypt but with HSM passphrase)
+    temp_dir = None
+    tar_path = None
+
+    try:
+        temp_dir = tempfile.mkdtemp(prefix='age_bundle_')
+
+        for item_path in paths:
+            item_path = os.path.normpath(item_path)
+            if not os.path.exists(item_path):
+                raise FileNotFoundError(f"Source path does not exist: {item_path}")
+            basename = os.path.basename(item_path)
+            dest = os.path.join(temp_dir, basename)
+            result = subprocess.run(
+                ['cp', '-a', '--', item_path, dest],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode('utf-8', errors='replace')
+                raise RuntimeError(f"cp failed for {item_path}: {stderr}")
+
+        cleaned_count = 0
+        if clean_metadata:
+            all_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                for filename in files:
+                    all_files.append(os.path.join(root, filename))
+
+            if all_files:
+                for fp in all_files:
+                    try:
+                        mat2_result = subprocess.run(
+                            ['mat2', '--inplace', '--unknown-members', 'omit', fp],
+                            capture_output=True, timeout=5
+                        )
+                        if mat2_result.returncode in (0, 1):
+                            cleaned_count += 1
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+
+        output_dir = os.path.dirname(os.path.normpath(paths[0]))
+        if len(paths) == 1:
+            bundle_name = os.path.basename(os.path.normpath(paths[0]))
+        else:
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            bundle_name = f"encrypted_bundle_{timestamp}"
+
+        # Create tar.gz in a SEPARATE temp location (not inside temp_dir!)
+        tar_fd, tar_path = tempfile.mkstemp(suffix='.tar.gz', prefix='age_archive_')
+        os.close(tar_fd)
+        result = subprocess.run([
+            'tar', '-czf', tar_path, '-C', temp_dir, '.'
+        ], capture_output=True)
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='replace')
+            raise RuntimeError(f"tar failed: {stderr}")
+
+        temp_encrypted = os.path.join(temp_dir, f"{bundle_name}.age")
+        success = ext.encrypt_file(tar_path, temp_encrypted, passphrase)
+
+        try:
+            os.remove(tar_path)
+            tar_path = None
+        except FileNotFoundError:
+            tar_path = None
+
+        encrypted_path = None
+        if success:
+            encrypted_path = os.path.join(output_dir, f"{bundle_name}.age")
+            shutil.move(temp_encrypted, encrypted_path)
+
+        if success and delete_originals:
+            for item_path in paths:
+                item_path = os.path.normpath(item_path)
+                if os.path.isfile(item_path):
+                    ext.secure_delete(item_path)
+                elif os.path.isdir(item_path):
+                    if ext.validate_path(item_path):
+                        shutil.rmtree(item_path)
+
+        if success:
+            msg = f"✅ {len(paths)} item(s) → {os.path.basename(encrypted_path)} (HSM)"
+            if clean_metadata and cleaned_count > 0:
+                msg += f" ({cleaned_count} cleaned)"
+            if delete_originals:
+                msg += " (originals deleted)"
+            subprocess.Popen(
+                ['notify-send', '-i', 'security-high', 'HSM Encryption Complete', msg],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        else:
+            subprocess.Popen(
+                ['notify-send', '-i', 'dialog-error', '-u', 'critical',
+                 'HSM Encryption Failed', 'Could not complete encryption.'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+    except Exception as e:
+        error_msg = str(e)[:200]
+        logger.error(f"Standalone HSM encryption error: {e}")
+        subprocess.Popen(
+            ['notify-send', '-i', 'dialog-error', '-u', 'critical',
+             'HSM Encryption Failed', error_msg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    finally:
+        if tar_path:
+            try:
+                os.remove(tar_path)
+            except (FileNotFoundError, OSError):
+                pass
+        if temp_dir:
+            try:
+                shutil.rmtree(temp_dir)
+            except (FileNotFoundError, OSError):
+                pass
+
+
+# ==============================================================================
+# CLI Entry Point
+# ==============================================================================
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='AGE Encryption Extension - CLI Mode',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--encrypt', metavar='JSON',
+                       help='Encrypt paths (JSON array)')
+    parser.add_argument('--decrypt', metavar='JSON',
+                       help='Decrypt paths (JSON array)')
+    parser.add_argument('--hsm', metavar='JSON',
+                       help='HSM encrypt paths (JSON array)')
+
+    args = parser.parse_args()
+
+    if args.encrypt:
+        paths = json.loads(args.encrypt)
+        standalone_encrypt(paths)
+    elif args.decrypt:
+        paths = json.loads(args.decrypt)
+        standalone_decrypt(paths)
+    elif args.hsm:
+        paths = json.loads(args.hsm)
+        standalone_hsm(paths)
+    else:
+        # No CLI args - this file was imported as a module (Nautilus extension)
+        pass

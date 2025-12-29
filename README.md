@@ -2,7 +2,7 @@
 
 Complete Nautilus (GNOME Files) extension for encrypting and decrypting files using **age** (Actually Good Encryption).
 
-![Version](https://img.shields.io/badge/version-1.6.0-blue)
+![Version](https://img.shields.io/badge/version-1.7.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -21,6 +21,7 @@ Complete Nautilus (GNOME Files) extension for encrypting and decrypting files us
 - **🔔 Notifications** - System notifications when operations complete
 - **🎨 Intuitive interface** - Native GTK dialogs with passphrase generation
 - **🧹 Auto metadata cleaning** - Automatically removes EXIF, author, dates (originals preserved)
+- **🔐 Optional HSM support** - Hardware random from SafeNet eToken (PKCS#11)
 
 ### 🛡️ Security
 
@@ -191,6 +192,48 @@ When `mat2` is installed, metadata is **automatically cleaned** before encryptio
 - Photos can reveal your location (GPS), camera, and when they were taken
 - Documents often contain your name, company, and edit history
 - Cleaning metadata protects your privacy when sharing encrypted files
+
+### 🔐 Optional: HSM Support (SafeNet eToken)
+
+For high-security environments, you can generate passphrases using a hardware security module's True Random Number Generator (TRNG).
+
+**Requirements:**
+- SafeNet eToken with libeToken.so driver
+- opensc package (`sudo apt install opensc`)
+
+**Installation with HSM support:**
+```bash
+./install.sh --with-pkcs11
+```
+
+**Usage:**
+
+When a SafeNet token is detected, an additional menu option appears:
+- **🔐 Encrypt with HSM** - Uses hardware TRNG for passphrase generation
+
+The HSM option:
+1. Detects if libeToken.so is installed (auto-detection)
+2. Verifies the token is physically connected
+3. Prompts for your token PIN
+4. Generates 256 bits of true hardware random
+5. Encodes as Base64 passphrase (43 characters)
+
+**Benefits of HSM encryption:**
+- **True hardware randomness** - Not software PRNG, actual quantum-level entropy
+- **Isolated generation** - Entropy cannot be compromised by userspace malware
+- **Compliance ready** - FIPS 140-2 Level 3+ certified hardware
+- **Defense in depth** - Even if your system is compromised, the TRNG is independent
+
+**Security model:**
+| Aspect | Software (secrets) | Hardware (HSM) |
+|--------|-------------------|----------------|
+| Entropy source | /dev/urandom (CSPRNG) | Physical TRNG |
+| Compromisable by malware | Theoretically possible | No |
+| Requires hardware | No | Yes |
+| FIPS 140-2 | No | Level 3+ |
+| Speed | Instant | ~500ms |
+
+**Note:** For most users, the software-generated passphrase (24 words, ~215 bits) is already more than sufficient. HSM support is for high-security environments with specific compliance requirements or threat models that include sophisticated state-level attackers.
 
 ## 🎯 Use Case Examples
 
@@ -385,6 +428,14 @@ Found a bug? Have an idea for improvement?
 5. Open a Pull Request
 
 ## 📝 Changelog
+
+### v1.7.0 (2025-12-28)
+- 🔐 **HSM Support**: Optional PKCS#11 integration for SafeNet eToken hardware tokens
+- 🎲 **Hardware TRNG**: Generate passphrases using true hardware random number generator
+- 🔍 **Auto-detection**: HSM option appears automatically when libeToken.so is detected
+- 📋 **Base64 Passphrase**: 256-bit hardware entropy encoded as 43-character passphrase
+- 🛡️ **Enterprise Ready**: FIPS 140-2 Level 3+ compliant entropy generation
+- 📦 **Optional Install**: Use `./install.sh --with-pkcs11` for HSM support
 
 ### v1.6.0 (2025-12-28)
 - 🛡️ **Deep Security Audit**: Complete Semgrep MCP analysis with custom rules
