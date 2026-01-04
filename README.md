@@ -72,7 +72,7 @@ All are installed automatically:
 
 ```bash
 # 1. Download the files
-git clone https://github.com/your-username/nautilus-age-extension.git
+git clone https://github.com/vdirienzo/nautilus-age-extension.git
 cd nautilus-age-extension
 
 # 2. Run the installer
@@ -81,6 +81,21 @@ chmod +x install.sh
 ```
 
 Done! The extension is now installed and working.
+
+### Development Setup (with uv)
+
+```bash
+cd nautilus-age-extension
+
+# Install dev dependencies
+uv sync --all-extras
+
+# Run linter
+uv run ruff check .
+
+# Run security scan
+uv run bandit -r .
+```
 
 ### Method 2: Manual installation
 
